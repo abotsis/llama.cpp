@@ -2300,6 +2300,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.n_parallel = value;
             }
         ).set_env("LLAMA_ARG_N_PARALLEL").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"-npd", "--parallel-decode"}, "N",
+            string_format("max slots generating (decoding) concurrently; others prefetch prefill (default: %d, -1 = --parallel)", params.n_parallel_decode),
+            [](common_params & params, int value) {
+                params.n_parallel_decode = value;
+            }
+        ).set_env("LLAMA_ARG_N_PARALLEL_DECODE").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",

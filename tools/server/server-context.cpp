@@ -3602,6 +3602,24 @@ private:
                     return;
                 }
 
+                // --parallel-decode: cap how many slots may be generating at once. A delegated
+                // slot whose remote prefill has completed (KV already loaded, dp_finished set) is
+                // held here instead of entering the decode batch, so speculative (MTP) decode keeps
+                // a single clean stream per device while the other slots keep prefetching in
+                // REMOTE_PREFILL. is_processing() stays true for a held STARTED slot, so the main
+                // loop keeps running and re-admits it once a decode slot frees.
+                if (slot.state == SLOT_STATE_STARTED && slot.dp_finished_id_task == slot.task->id) {
+                    const int n_decode_limit = params_base.n_parallel_decode > 0
+                        ? params_base.n_parallel_decode : (int) slots.size();
+                    int n_generating = 0;
+                    for (const auto & s : slots) {
+                        if (s.state == SLOT_STATE_GENERATING) { n_generating++; }
+                    }
+                    if (n_generating >= n_decode_limit) {
+                        return; // hold this delegated slot until a generating slot frees
+                    }
+                }
+
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
                     const auto & input_tokens = slot.task->tokens;
