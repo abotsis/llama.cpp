@@ -29,6 +29,7 @@ private:
     std::function<void(server_task &&)> callback_new_task;
     std::function<void(void)>           callback_update_slots;
     std::function<void(bool)>           callback_sleeping_state;
+    std::function<bool(void)>           callback_is_processing;
 
 public:
     // Add a new task to the end of the queue
@@ -93,6 +94,12 @@ public:
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
+    }
+
+    // Register function to check whether any slot is still processing (e.g. waiting on a
+    // remote prefill delegation); used to block the idle-sleep transition below
+    void on_is_processing(std::function<bool(void)> callback) {
+        callback_is_processing = std::move(callback);
     }
 
     // Register callback for sleeping state change; multiple callbacks are allowed

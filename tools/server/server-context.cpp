@@ -6,6 +6,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-prefill.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -23,6 +24,7 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <mutex>
 #include <utility>
 #include <fstream>
 
@@ -54,6 +56,38 @@ static uint32_t server_n_outputs_max(const common_params & params) {
     return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
 }
 
+// disaggregated prefill: pick how the serve side hands KV state back.
+//  - pure recurrent: no position-addressable attention KV at all, so the whole
+//    per-sequence state must transfer as one blob (whole mode).
+//  - hybrid: the attention KV is a full, rangeable cache only when there is no
+//    sliding-window attention. n_swa == 0 (plain hybrid, e.g. qwen35moe) can
+//    stream its attention by position range and send the recurrent state whole
+//    (hybrid-stream); n_swa > 0 (hybrid-iswa) masks older cells, so its
+//    attention is not rangeable and it stays whole.
+//  - everything else is dense and keeps v1 position-range streaming.
+// the arch check (is_hybrid && n_swa == 0) is the guard: it cleanly separates
+// plain hybrid from hybrid-iswa. an init-time probe via
+// llama_state_seq_get_size_range is NOT usable here - it returns 0 on an empty
+// sequence for every model, so it would false-negative a working hybrid.
+// non-hybrid SWA models are rejected separately by callers, not routed here.
+static dp_state_mode server_prefill_derive_mode(const llama_model * model) {
+    if (llama_model_is_recurrent(model)) {
+        return DP_MODE_WHOLE;
+    }
+    if (llama_model_is_hybrid(model)) {
+        return llama_model_n_swa(model) == 0 ? DP_MODE_HYBRID_STREAM : DP_MODE_WHOLE;
+    }
+    return DP_MODE_STREAM;
+}
+
+// published snapshot of remote-prefill serving readiness (see --prefill-serve), read by the
+// HTTP handler on POST /v1/prefill and by get_model_info()
+struct dp_serve_info {
+    bool     active = false;
+    dp_hello hello;
+    uint32_t n_tokens_max = 0;
+};
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -62,6 +96,7 @@ enum slot_state {
     SLOT_STATE_PROCESSING_PROMPT,
     SLOT_STATE_DONE_PROMPT,
     SLOT_STATE_GENERATING,
+    SLOT_STATE_REMOTE_PREFILL, // waiting for KV chunks from a remote prefill server
 };
 
 struct server_slot; // forward declaration
@@ -193,6 +228,24 @@ struct server_slot {
 
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
+
+    // disaggregated prefill (serving side): next position to stream
+    llama_pos dp_pos_sent = 0;
+
+    // disaggregated prefill (delegating side): generation id of the current
+    // in-flight delegation attempt, used to drop stale messages from a
+    // worker that a re-delegation has since superseded
+    uint64_t dp_generation = 0;
+
+    // disaggregated prefill (delegating side): bytes of KV state received
+    // for the current delegation attempt, reset when a new one starts
+    size_t dp_bytes_recv = 0;
+
+    // disaggregated prefill (delegating side): id of the task whose delegation
+    // already finished (ok or not). Forces the applied KV to be consumed even
+    // when cache_prompt is off and prevents re-delegating the same task, which
+    // would otherwise loop forever (delegate -> discard -> delegate)
+    int dp_finished_id_task = -1;
 
     size_t last_nl_pos = 0;
 
@@ -867,6 +920,23 @@ public:
     server_queue    queue_tasks;
     server_response queue_results;
 
+    // init_prefill_serving() (queue thread) writes this; prefill_serve_info() is read from HTTP
+    // worker threads, so the snapshot is published under a mutex
+    mutable std::mutex prefill_serve_mtx;
+    dp_serve_info prefill_serve_published;
+
+    dp_serve_info prefill_serve_info() const {
+        std::lock_guard<std::mutex> lk(prefill_serve_mtx);
+        return prefill_serve_published;
+    }
+
+    std::unique_ptr<server_prefill_client> prefill_client;
+    dp_state_mode prefill_mode = DP_MODE_STREAM; // resolved decode-side transfer mode
+    uint64_t n_prefill_delegated = 0;
+    uint64_t n_prefill_fallback  = 0;
+    uint64_t n_prefill_delegated_tokens = 0;
+    uint64_t n_prefill_rpc_bytes        = 0;
+
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
 
@@ -940,6 +1010,21 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // stop any in-flight delegated prefill workers before freeing ctx_tgt;
+        // otherwise a worker thread can still be applying a chunk against a
+        // context that is about to be destroyed (e.g. on the sleep path).
+        // safe to call again from ~server_prefill_client(): stop() joins all
+        // workers and clears clients_by_slot/workers, so a second call is a no-op.
+        if (prefill_client) {
+            prefill_client->stop();
+        }
+        // stop advertising remote-prefill serving so new POST /v1/prefill requests get 501; any
+        // in-flight prefill task is cancelled by its HTTP response destructor (server_prefill_res)
+        {
+            std::lock_guard<std::mutex> lk(prefill_serve_mtx);
+            prefill_serve_published = {};
+        }
+
         spec.reset();
         spec_init.reset();
 
@@ -1385,10 +1470,53 @@ private:
             return init();
         }
 
+        // destroy() cleared the published prefill serving info on the way into sleep; resuming
+        // needs it re-published before this instance can serve remote prefill again
+        if (!init_prefill_serving()) {
+            return false;
+        }
+
         if (callback_state) {
             callback_state(SERVER_STATE_READY, {});
         }
 
+        return true;
+    }
+
+    // (re-)publishes remote-prefill serving readiness from params_base.prefill_serve. requests
+    // are served over POST /v1/prefill on the main HTTP port. called once from init() on cold
+    // load, and again from load_model()'s resume path since destroy() clears the published info
+    // on every sleep
+    bool init_prefill_serving() {
+        {
+            // clear any stale info from a previous load (e.g. sleep/wake cycle);
+            // set again below only once serving is confirmed active
+            std::lock_guard<std::mutex> lk(prefill_serve_mtx);
+            prefill_serve_published = {};
+        }
+        if (!params_base.prefill_serve) {
+            return true;
+        }
+        if (llama_model_n_swa(model_tgt) > 0) {
+            SRV_WRN("%s", "--prefill-serve is not supported for SWA models - disabling remote prefill serving\n");
+            return true;
+        }
+
+        const dp_state_mode mode = server_prefill_derive_mode(model_tgt);
+
+        dp_hello hello = dp_make_hello(
+                model_tgt, llama_n_ctx(ctx_tgt),
+                params_base.cache_type_k, params_base.cache_type_v, /*lora_hash*/ 0);
+        hello.state_mode = mode;
+        hello.has_dft    = ctx_dft != nullptr;
+
+        const uint32_t n_ctx_slot = llama_n_ctx(ctx_tgt) / params_base.n_parallel;
+        {
+            std::lock_guard<std::mutex> lk(prefill_serve_mtx);
+            prefill_serve_published = { /*active*/ true, hello, n_ctx_slot };
+        }
+        SRV_INF("serving remote prefill over POST /v1/prefill (mode: %s)\n",
+                dp_state_mode_str(mode));
         return true;
     }
 
@@ -1408,6 +1536,14 @@ private:
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
+        });
+        queue_tasks.on_is_processing([this]() {
+            for (auto & slot : slots) {
+                if (slot.is_processing()) {
+                    return true;
+                }
+            }
+            return false;
         });
 
         metrics.init();
@@ -1494,6 +1630,110 @@ private:
                 }
                 if (!supported && enabled) {
                     SRV_WRN("%s", "chat template does NOT support preserving reasoning, --reasoning-preserve has no effect\n");
+                }
+            }
+        }
+
+        if (!init_prefill_serving()) {
+            return false;
+        }
+
+        if (!params_base.prefill_rpc.empty()) {
+            const std::string & addr = params_base.prefill_rpc;
+            const char * flag_name   = "--prefill-rpc";
+
+            std::string host;
+            int port = 0;
+            if (!dp_parse_host_port(addr, host, port)) {
+                SRV_ERR("invalid %s address: %s\n", flag_name, addr.c_str());
+                return false;
+            }
+            if (params_base.speculative.has_dft()) {
+                // separate draft model: its KV is never transferred, so delegation
+                // stays unsupported regardless of mode
+                SRV_WRN("%s is not supported with a draft model - disabling delegation\n", flag_name);
+            } else if (llama_model_n_swa(model_tgt) > 0) {
+                SRV_WRN("%s is not supported for SWA models - disabling delegation\n", flag_name);
+            } else {
+                const dp_state_mode derived = server_prefill_derive_mode(model_tgt);
+                prefill_mode = derived;
+                if (params_base.prefill_rpc_mode == "stream") {
+                    prefill_mode = DP_MODE_STREAM;
+                } else if (params_base.prefill_rpc_mode == "whole") {
+                    prefill_mode = DP_MODE_WHOLE;
+                } else if (params_base.prefill_rpc_mode == "hybrid_stream") {
+                    prefill_mode = DP_MODE_HYBRID_STREAM;
+                }
+
+                // dense position-range streaming is only valid for a dense model;
+                // hybrid/recurrent models derive to whole or hybrid_stream, so an
+                // explicit stream override cannot work for them
+                if (prefill_mode == DP_MODE_STREAM && derived != DP_MODE_STREAM) {
+                    SRV_ERR("%s", "--prefill-rpc-mode stream is not possible for hybrid/recurrent models\n");
+                    return false;
+                }
+
+                // hybrid-stream requires a plain (non-SWA) hybrid model; a dense or
+                // pure-recurrent model never derives it, so an explicit override
+                // would only be rejected by the peer at delegation time
+                if (prefill_mode == DP_MODE_HYBRID_STREAM && derived != DP_MODE_HYBRID_STREAM) {
+                    SRV_ERR("%s", "--prefill-rpc-mode hybrid_stream is only possible for plain (non-SWA) hybrid models\n");
+                    return false;
+                }
+
+                // an MTP draft context (same model, spec_mtp path) transfers fine in
+                // whole mode but is unsupported in stream mode (v1 rule)
+                if (prefill_mode == DP_MODE_STREAM && ctx_dft) {
+                    SRV_WRN("%s is not supported with an MTP draft context in stream mode - disabling delegation\n", flag_name);
+                } else {
+                    dp_hello hello = dp_make_hello(
+                            model_tgt, llama_n_ctx(ctx_tgt),
+                            params_base.cache_type_k, params_base.cache_type_v, /*lora_hash*/ 0);
+                    hello.state_mode = prefill_mode;
+                    hello.has_dft    = dp_mode_transfers_whole(prefill_mode) && ctx_dft != nullptr;
+
+                    auto post_result = [this](server_task && task) {
+                        task.id = queue_tasks.get_new_id();
+                        queue_tasks.post(std::move(task));
+                    };
+
+                    auto on_chunk = [post_result](int id_slot, int id_task, uint64_t gen, uint32_t p0, uint32_t p1, std::vector<uint8_t> && blob) {
+                        server_task task(SERVER_TASK_TYPE_PREFILL_RESULT);
+                        task.prefill_res = { id_slot, id_task, gen, false, true, p0, p1, std::move(blob), "", false, false, {} };
+                        post_result(std::move(task));
+                    };
+                    auto on_done = [post_result](int id_slot, int id_task, uint64_t gen, bool ok2, const std::string & msg) {
+                        server_task task(SERVER_TASK_TYPE_PREFILL_RESULT);
+                        task.prefill_res = { id_slot, id_task, gen, true, ok2, 0, 0, {}, msg, false, false, {} };
+                        post_result(std::move(task));
+                    };
+                    auto on_whole = [post_result](int id_slot, int id_task, uint64_t gen, std::vector<uint8_t> && main, std::vector<uint8_t> && dft) {
+                        server_task task(SERVER_TASK_TYPE_PREFILL_RESULT);
+                        task.prefill_res = { id_slot, id_task, gen, true, true, 0, 0, std::move(main), "", true, false, std::move(dft) };
+                        post_result(std::move(task));
+                    };
+                    // hybrid-stream: the recurrent tail (+ optional draft), applied once at
+                    // DONE after the attention CHUNKs (delivered via on_chunk) have landed.
+                    auto on_recurrent = [post_result](int id_slot, int id_task, uint64_t gen, std::vector<uint8_t> && recur, std::vector<uint8_t> && dft) {
+                        server_task task(SERVER_TASK_TYPE_PREFILL_RESULT);
+                        task.prefill_res = { id_slot, id_task, gen, true, true, 0, 0, std::move(recur), "", true, true, std::move(dft) };
+                        post_result(std::move(task));
+                    };
+
+                    prefill_client = std::make_unique<server_prefill_client>();
+                    bool ok = prefill_client->init(host, port, params_base.prefill_rpc_api_key, hello,
+                        params_base.prefill_rpc_max_inflight,
+                        on_chunk, on_done, on_whole, on_recurrent);
+                    if (ok) {
+                        SRV_INF("delegating prefill to %s (mode: %s, min uncached suffix: %d tokens)\n",
+                                addr.c_str(),
+                                dp_state_mode_str(prefill_mode),
+                                params_base.prefill_rpc_min_tokens);
+                    }
+                    if (!ok) {
+                        SRV_ERR("%s", "failed to initialize prefill client\n");
+                        return false;
+                    }
                 }
             }
         }
@@ -1793,6 +2033,10 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
+        if (slot.task->type == SERVER_TASK_TYPE_REMOTE_PREFILL) {
+            slot.dp_pos_sent = (llama_pos) slot.task->prefill_p0;
+        }
+
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
@@ -1997,6 +2241,13 @@ private:
     }
 
     void send_error(const server_slot & slot, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
+        if (slot.task && slot.task->type == SERVER_TASK_TYPE_REMOTE_PREFILL) {
+            if (slot.task->prefill_pipe) {
+                slot.task->prefill_pipe->send_error(DP_ERR_INTERNAL, error);
+            }
+            return; // no HTTP client to notify
+        }
+
         send_error(slot.task->id, error, type, slot.task->n_tokens(), slot.n_ctx);
     }
 
@@ -2344,6 +2595,7 @@ private:
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
+            case SERVER_TASK_TYPE_REMOTE_PREFILL:
                 {
                     // special case: if input is provided via CLI, tokenize it first
                     // otherwise, no need to tokenize as it's already done inside the HTTP thread
@@ -2416,6 +2668,9 @@ private:
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
+                            if (slot.state == SLOT_STATE_REMOTE_PREFILL && prefill_client) {
+                                prefill_client->cancel(slot.id);
+                            }
                             slot.release();
                             break;
                         }
@@ -2500,6 +2755,11 @@ private:
 
                     res->n_decode_total          = metrics.n_decode_total;
                     res->n_busy_slots_total      = metrics.n_busy_slots_total;
+
+                    res->n_prefill_delegated = n_prefill_delegated;
+                    res->n_prefill_fallback  = n_prefill_fallback;
+                    res->n_prefill_delegated_tokens = n_prefill_delegated_tokens;
+                    res->n_prefill_rpc_bytes        = n_prefill_rpc_bytes;
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -2662,6 +2922,161 @@ private:
                     res->id = task.id;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_PREFILL_RESULT:
+                {
+                    auto & pr = task.prefill_res;
+
+                    server_slot * slot = get_slot_by_id(pr.id_slot);
+                    if (slot == nullptr || slot->state != SLOT_STATE_REMOTE_PREFILL ||
+                        !slot->task || slot->task->id != pr.id_task ||
+                        pr.generation != slot->dp_generation) {
+                        break; // stale result from an aborted/finished/superseded delegation
+                    }
+
+                    // hybrid-stream fallback: attention chunks may have landed with no recurrent
+                    // tail, so the partial state is unusable - drop it explicitly and start clean.
+                    // (stream keeps its partial prefix for local resume; whole never streams chunks.)
+                    auto dp_drop_partial = [&]() {
+                        if (prefill_mode != DP_MODE_HYBRID_STREAM) {
+                            return;
+                        }
+                        common_context_seq_rm(ctx_tgt, slot->id, -1, -1);
+                        if (ctx_dft) {
+                            common_context_seq_rm(ctx_dft, slot->id, -1, -1);
+                        }
+                        slot->prompt.tokens.clear();
+                    };
+
+                    if (pr.is_done) {
+                        if (!pr.ok) {
+                            SLT_WRN(*slot, "remote prefill failed (%s), falling back to local prefill\n", pr.msg.c_str());
+                            dp_drop_partial();
+                            n_prefill_fallback++;
+                        } else if (pr.whole) {
+                            // terminal state apply, frame-driven (a STATE blob arrived):
+                            //  - whole mode replaces the whole target sequence (flags NONE);
+                            //  - hybrid-stream restores only the recurrent tail (PARTIAL_ONLY),
+                            //    leaving the attention KV the APPEND chunks already built - so
+                            //    generation must not have resumed before this (the slot stays in
+                            //    REMOTE_PREFILL until here; the resume barrier).
+                            // the draft (MTP) sequence state is replaced whole in both modes.
+                            const llama_state_seq_flags main_flags = pr.recurrent
+                                ? LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY : LLAMA_STATE_SEQ_FLAGS_NONE;
+                            bool applied = llama_state_seq_set_data_ext(
+                                    ctx_tgt, pr.blob.data(), pr.blob.size(), slot->id, main_flags) == pr.blob.size();
+                            if (applied && !pr.blob_dft.empty()) {
+                                applied = llama_state_seq_set_data_ext(
+                                        ctx_dft, pr.blob_dft.data(), pr.blob_dft.size(), slot->id, LLAMA_STATE_SEQ_FLAGS_NONE) == pr.blob_dft.size();
+                                if (!applied) {
+                                    // all-or-nothing: do not leave target KV without matching draft state
+                                    common_context_seq_rm(ctx_tgt, slot->id, -1, -1);
+                                    common_context_seq_rm(ctx_dft, slot->id, -1, -1);
+                                }
+                            }
+                            if (!applied) {
+                                // all-or-nothing: drop whatever landed (for hybrid-stream this
+                                // includes the attention the chunks built) so local prefill starts clean
+                                common_context_seq_rm(ctx_tgt, slot->id, -1, -1);
+                                if (ctx_dft) {
+                                    common_context_seq_rm(ctx_dft, slot->id, -1, -1);
+                                }
+                                SLT_WRN(*slot, "failed to apply %s prefill state - falling back to local prefill\n",
+                                        pr.recurrent ? "hybrid-stream recurrent" : "whole");
+                                n_prefill_fallback++;
+                                slot->prompt.tokens.clear();
+                                slot->dp_finished_id_task = pr.id_task;
+                                slot->state = SLOT_STATE_STARTED;
+                                break;
+                            }
+
+                            // adopt the token list the restored state covers: all but the last
+                            // prompt token (see the delegation hook), which is decoded locally.
+                            // for hybrid-stream this matches the list the attention chunks built.
+                            llama_tokens toks = slot->task->tokens.get_text_tokens();
+                            toks.pop_back();
+                            slot->prompt.tokens.clear();
+                            slot->prompt.tokens.insert(toks);
+                            slot->dp_bytes_recv += pr.blob.size() + pr.blob_dft.size();
+
+                            // whole/hybrid-stream transfer the full prompt regardless of any
+                            // locally cached prefix (n_prompt_tokens_cache), unlike stream mode
+                            const uint64_t n_tokens_delegated = slot->prompt.tokens.size();
+                            const double   t_ms = (ggml_time_us() - slot->t_start_process_prompt) / 1000.0;
+                            if (pr.recurrent) {
+                                // hybrid-stream split: attention KV arrived as APPEND chunks,
+                                // the recurrent tail (pr.blob) as one whole blob at DONE
+                                const size_t recur_bytes = pr.blob.size();
+                                const size_t attn_bytes  = slot->dp_bytes_recv - recur_bytes - pr.blob_dft.size();
+                                SLT_INF(*slot, "remote prefill complete: %" PRIu64 " tokens (hybrid-stream), %.2f MiB received (%.2f MiB attention + %.2f MiB recurrent, dft: %zu bytes), %.1f ms\n",
+                                        n_tokens_delegated, slot->dp_bytes_recv / (1024.0 * 1024.0),
+                                        attn_bytes / (1024.0 * 1024.0), recur_bytes / (1024.0 * 1024.0), pr.blob_dft.size(), t_ms);
+                            } else {
+                                SLT_INF(*slot, "remote prefill complete: %" PRIu64 " tokens (whole), %.2f MiB received (dft: %zu bytes), %.1f ms\n",
+                                        n_tokens_delegated, slot->dp_bytes_recv / (1024.0 * 1024.0), pr.blob_dft.size(), t_ms);
+                            }
+                            n_prefill_delegated_tokens += n_tokens_delegated;
+                            n_prefill_rpc_bytes        += slot->dp_bytes_recv;
+                        } else {
+                            // tokens actually applied via remote chunks, excluding the
+                            // locally-cached prefix (n_prompt_tokens_cache)
+                            const uint64_t n_tokens_delegated = slot->prompt.tokens.size() - slot->n_prompt_tokens_cache;
+                            const double   t_ms = (ggml_time_us() - slot->t_start_process_prompt) / 1000.0;
+                            SLT_INF(*slot, "remote prefill complete: %" PRIu64 " tokens, %.2f MiB received, %.1f ms\n",
+                                    n_tokens_delegated, slot->dp_bytes_recv / (1024.0 * 1024.0), t_ms);
+                            n_prefill_delegated_tokens += n_tokens_delegated;
+                            n_prefill_rpc_bytes        += slot->dp_bytes_recv;
+                        }
+                        // re-enter the prompt path; whatever prefix was applied is reused,
+                        // any remainder is prefilled locally
+                        slot->dp_finished_id_task = pr.id_task;
+                        slot->state = SLOT_STATE_STARTED;
+                        break;
+                    }
+
+                    // chunk
+                    if ((llama_pos) pr.p0 != slot->prompt.tokens.pos_next()) {
+                        SLT_WRN(*slot, "prefill chunk out of order (got %u, expected %d) - falling back\n",
+                                pr.p0, slot->prompt.tokens.pos_next());
+                        prefill_client->cancel(slot->id, /*user_initiated=*/false);
+                        dp_drop_partial();
+                        n_prefill_fallback++;
+                        slot->state = SLOT_STATE_STARTED;
+                        break;
+                    }
+
+                    // bound the peer-supplied range before indexing slot->task->tokens with it;
+                    // compare in unsigned space so a p1 >= 0x80000000 cannot sign-flip negative
+                    // and bypass the check (n_tokens() is int32_t and always >= 0)
+                    if (pr.p1 > (uint32_t) slot->task->n_tokens() || pr.p1 <= pr.p0) {
+                        SLT_WRN(*slot, "prefill chunk range [%u, %u) out of bounds (n_tokens = %d) - falling back\n",
+                                pr.p0, pr.p1, slot->task->n_tokens());
+                        prefill_client->cancel(slot->id, /*user_initiated=*/false);
+                        dp_drop_partial();
+                        n_prefill_fallback++;
+                        slot->state = SLOT_STATE_STARTED;
+                        break;
+                    }
+
+                    const size_t n = llama_state_seq_set_data_ext(
+                            ctx_tgt, pr.blob.data(), pr.blob.size(), slot->id, LLAMA_STATE_SEQ_FLAGS_APPEND);
+                    if (n != pr.blob.size()) {
+                        SLT_WRN(*slot, "failed to apply prefill chunk [%u, %u) - falling back\n", pr.p0, pr.p1);
+                        prefill_client->cancel(slot->id, /*user_initiated=*/false);
+                        dp_drop_partial();
+                        n_prefill_fallback++;
+                        slot->state = SLOT_STATE_STARTED;
+                        break;
+                    }
+
+                    slot->dp_bytes_recv += pr.blob.size();
+
+                    // keep the token list in lockstep with the KV contents
+                    for (uint32_t i = pr.p0; i < pr.p1; ++i) {
+                        slot->prompt.tokens.push_back(slot->task->tokens[i]);
+                    }
+
+                    SLT_DBG(*slot, "applied prefill chunk [%u, %u), %zu bytes\n", pr.p0, pr.p1, pr.blob.size());
+                } break;
         }
     }
 
@@ -2692,6 +3107,9 @@ private:
     void abort_all_slots(const std::string & reason) {
         for (auto & slot : slots) {
             if (slot.is_processing()) {
+                if (slot.state == SLOT_STATE_REMOTE_PREFILL && prefill_client) {
+                    prefill_client->cancel(slot.id);
+                }
                 send_error(slot, reason, ERROR_TYPE_SERVER);
                 slot.release();
             }
@@ -2742,19 +3160,21 @@ private:
         }
 #endif
 
-        // check if all slots are idle
+        // check if any slot has local work to batch this iteration; slots waiting on a
+        // remote prefill delegation contribute nothing here, their progress is driven by
+        // PREFILL_RESULT tasks posted from another thread, which wake this loop on their own
         {
-            bool all_idle = true;
+            bool has_local_work = false;
 
             for (auto & slot : slots) {
-                if (slot.is_processing()) {
-                    all_idle = false;
+                if (slot.is_processing() && slot.state != SLOT_STATE_REMOTE_PREFILL) {
+                    has_local_work = true;
                     break;
                 }
             }
 
-            if (all_idle) {
-                SRV_TRC("%s", "all slots are idle\n");
+            if (!has_local_work) {
+                SRV_TRC("%s", "no local work, idling until next task\n");
                 return; // skip further processing
 
             } else {
@@ -2815,6 +3235,144 @@ private:
                 break; // stop any further processing
             }
 
+        }
+
+        // stream freshly decoded KV ranges to remote prefill clients
+        emit_prefill_chunks();
+    }
+
+    // stream freshly decoded KV ranges to remote prefill clients
+    void emit_prefill_chunks() {
+        for (auto & slot : slots) {
+            if (!slot.task || slot.task->type != SERVER_TASK_TYPE_REMOTE_PREFILL) {
+                continue;
+            }
+            if (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_DONE_PROMPT) {
+                continue;
+            }
+
+            const auto & pipe = slot.task->prefill_pipe;
+
+            if (!pipe->alive()) {
+                SLT_WRN(slot, "%s", "prefill client disconnected, releasing slot\n");
+                slot.release();
+                continue;
+            }
+
+            const dp_state_mode mode = (dp_state_mode) slot.task->prefill_state_mode;
+
+            if (mode == DP_MODE_WHOLE) {
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                    pipe->send_progress((uint32_t) slot.prompt.n_tokens());
+                }
+
+                if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                    // whole-blob completion: serialize the full sequence state(s)
+                    const size_t budget    = DP_MAX_PAYLOAD - sizeof(dp_msg_state_hdr);
+                    const size_t size_main = llama_state_seq_get_size_ext(ctx_tgt, slot.id, 0);
+                    const size_t size_dft  = slot.task->prefill_want_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, 0) : 0;
+                    if (size_main == 0 || size_main > budget || size_dft > budget) {
+                        SLT_ERR(slot, "%s", "whole-mode state too large or empty\n");
+                        pipe->send_error(DP_ERR_INTERNAL, "state too large or serialization failed");
+                        slot.release();
+                        continue;
+                    }
+
+                    std::vector<uint8_t> blob_main(size_main);
+                    if (llama_state_seq_get_data_ext(ctx_tgt, blob_main.data(), size_main, slot.id, 0) != size_main) {
+                        SLT_ERR(slot, "%s", "failed to serialize whole-mode target state\n");
+                        pipe->send_error(DP_ERR_INTERNAL, "state too large or serialization failed");
+                        slot.release();
+                        continue;
+                    }
+                    pipe->send_state(DP_STATE_TARGET_WHOLE, std::move(blob_main));
+
+                    if (slot.task->prefill_want_dft) {
+                        std::vector<uint8_t> blob_dft(size_dft);
+                        if (size_dft == 0 || llama_state_seq_get_data_ext(ctx_dft, blob_dft.data(), size_dft, slot.id, 0) != size_dft) {
+                            SLT_ERR(slot, "%s", "failed to serialize whole-mode draft state\n");
+                            pipe->send_error(DP_ERR_INTERNAL, "state too large or serialization failed");
+                            slot.release();
+                            continue;
+                        }
+                        pipe->send_state(DP_STATE_DRAFT_WHOLE, std::move(blob_dft));
+                    }
+
+                    pipe->send_done((uint32_t) slot.task->n_tokens());
+                    SLT_INF(slot, "remote prefill done (whole), %d tokens\n", slot.task->n_tokens());
+                    slot.release();
+                }
+                continue;
+            }
+
+            // STREAM and HYBRID_STREAM both stream the target attention KV by
+            // position range as it completes; hybrid-stream additionally sends the
+            // (bounded) recurrent state whole at DONE_PROMPT, after the last range.
+            const llama_pos p1 = slot.prompt.tokens.pos_next();
+
+            if (p1 > slot.dp_pos_sent) {
+                const llama_pos p0 = slot.dp_pos_sent;
+
+                const size_t size = llama_state_seq_get_size_range(ctx_tgt, slot.id, p0, p1, 0);
+                std::vector<uint8_t> buf(size);
+                if (size == 0 || llama_state_seq_get_data_range(ctx_tgt, buf.data(), size, slot.id, p0, p1, 0) != size) {
+                    SLT_ERR(slot, "failed to serialize range [%d, %d)\n", p0, p1);
+                    pipe->send_error(DP_ERR_INTERNAL, "state serialization failed");
+                    slot.release();
+                    continue;
+                }
+
+                pipe->send_chunk((uint32_t) p0, (uint32_t) p1, std::move(buf));
+                slot.dp_pos_sent = p1;
+
+                SLT_DBG(slot, "sent prefill chunk [%d, %d), %zu bytes\n", p0, p1, size);
+            }
+
+            if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                if (mode == DP_MODE_HYBRID_STREAM) {
+                    // recurrent state is O(1) in tokens; sent whole exactly once
+                    // after the final attention range above. draft (MTP) is a
+                    // plain attention KV cache - honored like whole mode.
+                    const size_t budget    = DP_MAX_PAYLOAD - sizeof(dp_msg_state_hdr);
+                    const size_t size_recr = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    const size_t size_dft  = slot.task->prefill_want_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, 0) : 0;
+                    if (size_recr == 0 || size_recr > budget || size_dft > budget) {
+                        SLT_ERR(slot, "%s", "hybrid-stream recurrent state too large or empty\n");
+                        pipe->send_error(DP_ERR_INTERNAL, "state too large or serialization failed");
+                        slot.release();
+                        continue;
+                    }
+
+                    std::vector<uint8_t> blob_recr(size_recr);
+                    if (llama_state_seq_get_data_ext(ctx_tgt, blob_recr.data(), size_recr, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != size_recr) {
+                        SLT_ERR(slot, "%s", "failed to serialize hybrid-stream recurrent state\n");
+                        pipe->send_error(DP_ERR_INTERNAL, "state too large or serialization failed");
+                        slot.release();
+                        continue;
+                    }
+                    pipe->send_state(DP_STATE_TARGET_RECURRENT, std::move(blob_recr));
+
+                    if (slot.task->prefill_want_dft) {
+                        std::vector<uint8_t> blob_dft(size_dft);
+                        if (size_dft == 0 || llama_state_seq_get_data_ext(ctx_dft, blob_dft.data(), size_dft, slot.id, 0) != size_dft) {
+                            SLT_ERR(slot, "%s", "failed to serialize hybrid-stream draft state\n");
+                            pipe->send_error(DP_ERR_INTERNAL, "state too large or serialization failed");
+                            slot.release();
+                            continue;
+                        }
+                        pipe->send_state(DP_STATE_DRAFT_WHOLE, std::move(blob_dft));
+                    }
+
+                    pipe->send_done((uint32_t) slot.task->n_tokens());
+                    SLT_INF(slot, "remote prefill done (hybrid-stream), %d tokens\n", slot.task->n_tokens());
+                    slot.release();
+                    continue;
+                }
+
+                pipe->send_done((uint32_t) slot.task->n_tokens());
+                SLT_INF(slot, "remote prefill done, %d tokens\n", slot.task->n_tokens());
+                slot.release();
+            }
         }
     }
 
@@ -3128,7 +3686,12 @@ private:
                                 return;
                             }
 
-                            if (slot.task->params.cache_prompt) {
+                            // a finished remote prefill for this task must be consumed even
+                            // when cache_prompt is off - it is this request's own progress,
+                            // not cross-request cache reuse
+                            const bool dp_resume = slot.dp_finished_id_task == slot.task->id;
+
+                            if (slot.task->params.cache_prompt || dp_resume) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -3330,6 +3893,66 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        // disaggregated prefill: hand long uncached suffixes to the remote peer.
+                        // whole mode transfers the full prompt regardless of any locally cached
+                        // prefix (restore replaces the whole sequence), so the threshold compares
+                        // the full token count rather than the uncached suffix.
+                        const bool dp_eligible_len = dp_mode_transfers_whole(prefill_mode)
+                            ? slot.task->n_tokens() > params_base.prefill_rpc_min_tokens
+                            : slot.task->n_tokens() - n_past > params_base.prefill_rpc_min_tokens;
+
+                        // media presence is checked per-prompt: a multimodal-enabled
+                        // server (mmproj loaded) still delegates text-only prompts
+                        if (prefill_client &&
+                            slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
+                            slot.can_split() && !slot.task->tokens.has_media() &&
+                            slot.alora_invocation_start <= 0 &&
+                            slot.dp_finished_id_task != slot.task->id &&
+                            dp_eligible_len) {
+
+                            std::vector<llama_token> tokens = slot.task->tokens.get_text_tokens();
+                            if (dp_mode_transfers_whole(prefill_mode)) {
+                                // delegate all but the last prompt token: the restored state then
+                                // ends exactly one position short, and decoding that token locally
+                                // (for logits) needs no rollback. rolling back a restored state is
+                                // impossible for hybrid/recurrent models and would force a full
+                                // local reprocess, discarding the entire transfer
+                                tokens.pop_back();
+                            }
+                            const uint32_t p0       = dp_mode_transfers_whole(prefill_mode) ? 0 : (uint32_t) n_past;
+                            const bool     want_dft = dp_mode_transfers_whole(prefill_mode) && ctx_dft != nullptr;
+
+                            uint64_t gen = 0;
+                            if (prefill_client->try_delegate(slot.id, slot.task->id, std::move(tokens), p0,
+                                                              prefill_mode, want_dft, gen)) {
+                                if (prefill_mode == DP_MODE_STREAM) {
+                                    // drop any stale cells beyond the reused prefix; incoming
+                                    // chunks will append starting exactly at n_past. whole mode
+                                    // skips this: set_data_ext(flags=0) replaces the sequence.
+                                    common_context_seq_rm(ctx_tgt, slot.id, n_past, -1);
+                                } else if (prefill_mode == DP_MODE_HYBRID_STREAM) {
+                                    // hybrid-stream streams the attention KV by range (APPEND) from
+                                    // position 0 and restores the recurrent tail whole at DONE, so
+                                    // the target sequence must start empty: clear the KV and the
+                                    // token list so the first chunk (p0 == 0) lands at pos_next == 0.
+                                    common_context_seq_rm(ctx_tgt, slot.id, -1, -1);
+                                    slot.prompt.tokens.clear();
+                                    slot.n_prompt_tokens_cache = 0;
+                                }
+
+                                slot.state         = SLOT_STATE_REMOTE_PREFILL;
+                                slot.dp_generation  = gen;
+                                slot.dp_bytes_recv  = 0;
+                                n_prefill_delegated++;
+
+                                SLT_INF(slot, "delegating prefill, n_tokens = %d, p0 = %d, mode = %s%s\n",
+                                        slot.task->n_tokens(), p0,
+                                        dp_state_mode_str(prefill_mode),
+                                        want_dft ? " (+dft)" : "");
+                                return;
+                            }
+                        }
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
@@ -3503,13 +4126,18 @@ private:
 
                         GGML_ASSERT(batch.size() > 0);
 
-                        // extract the logits only for the last token
-                        batch.set_output(batch.size() - 1, true);
+                        if (slot.task->type == SERVER_TASK_TYPE_REMOTE_PREFILL) {
+                            // no sampling; chunks are emitted after decode
+                            slot.i_batch = -1;
+                        } else {
+                            // extract the logits only for the last token
+                            batch.set_output(batch.size() - 1, true);
 
-                        slot.n_decoded = 0;
-                        slot.i_batch   = batch.size() - 1;
+                            slot.n_decoded = 0;
+                            slot.i_batch   = batch.size() - 1;
 
-                        slot.init_sampler();
+                            slot.init_sampler();
+                        }
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
@@ -3709,6 +4337,10 @@ private:
             if (!is_inside_view(slot.i_batch)) {
                 // the required token not in this sub-batch, skip
                 return;
+            }
+
+            if (slot.task->type == SERVER_TASK_TYPE_REMOTE_PREFILL) {
+                return; // handled by emit_prefill_chunks() after the decode loop
             }
 
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
@@ -4024,6 +4656,33 @@ struct server_res_generator : server_res_spipe {
     }
 };
 
+// streaming response for POST /v1/prefill: drains the dp_pipe that emit_prefill_chunks() feeds
+// into the octet-stream body. the destructor runs from process_handler_response's on_complete on
+// both natural end and peer drop, so a client that disconnects before DONE cancels the slot task.
+struct server_prefill_res : server_http_res {
+    server_queue &           queue_tasks;
+    std::shared_ptr<dp_pipe> pipe;
+
+    server_prefill_res(server_queue & queue_tasks, std::shared_ptr<dp_pipe> pipe, std::function<bool()> should_stop)
+            : queue_tasks(queue_tasks), pipe(std::move(pipe)) {
+        status       = 200;
+        content_type = "application/octet-stream";
+        next = [pipe = this->pipe, should_stop = std::move(should_stop)](std::string & out) {
+            return pipe->read(out, should_stop);
+        };
+    }
+
+    ~server_prefill_res() override {
+        pipe->close_read();
+        if (!pipe->finished()) {
+            server_task task(SERVER_TASK_TYPE_CANCEL);
+            task.id        = queue_tasks.get_new_id();
+            task.id_target = pipe->id_task;
+            queue_tasks.post(std::move(task), /*front=*/true);
+        }
+    }
+};
+
 void server_context::set_state_callback(server_state_callback_t callback) {
     impl->callback_state = std::move(callback);
     impl->queue_tasks.on_sleeping_state([this](bool sleeping) {
@@ -4335,6 +4994,80 @@ void server_routes::init_routes() {
         return res;
     };
 
+    // serving side of disaggregated prefill: process the client's prompt and stream the resulting
+    // KV state back as a framed octet-stream (CHUNK... DONE in stream mode, STATE... DONE in whole
+    // mode). registered only when --prefill-serve is set (server.cpp).
+    this->post_prefill = [this](const server_http_req & req) -> server_http_res_ptr {
+        if (params.sleep_idle_seconds >= 0) {
+            queue_tasks.wait_until_no_sleep();
+        }
+
+        auto make_error = [](const std::string & msg, error_type type) -> server_http_res_ptr {
+            auto r = std::make_unique<server_http_res>();
+            const json e = format_error_response(msg, type);
+            r->status = json_value(e, "code", 500);
+            r->data   = safe_json_to_str({{ "error", e }});
+            return r;
+        };
+
+        const dp_serve_info info = ctx_server.prefill_serve_info();
+        if (!info.active) {
+            return make_error("remote prefill serving is not enabled", ERROR_TYPE_NOT_SUPPORTED);
+        }
+
+        dp_prefill_request preq;
+        std::string err;
+        try {
+            if (!dp_prefill_request_parse(json::parse(req.body), preq, err)) {
+                return make_error(err, ERROR_TYPE_INVALID_REQUEST);
+            }
+        } catch (const std::exception & e) {
+            return make_error(std::string("invalid JSON body: ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
+        }
+
+        std::string reason;
+        if (!dp_hello_compatible(preq.client, info.hello, reason)) {
+            return make_error(reason, ERROR_TYPE_INVALID_REQUEST);
+        }
+        if (!reason.empty()) {
+            SRV_WRN("remote prefill client: %s\n", reason.c_str()); // lora mismatch: warning only
+        }
+
+        // a hybrid/recurrent serving model has no dense position-addressable state
+        // to stream: it advertises whole or hybrid_stream, never plain stream
+        if (preq.state_mode == DP_MODE_STREAM && info.hello.state_mode != DP_MODE_STREAM) {
+            return make_error("stream mode not supported for this model", ERROR_TYPE_INVALID_REQUEST);
+        }
+        // hybrid-stream emits split attention-range + recurrent-whole frames; only
+        // honor it when this server derives the same mode for its model. on
+        // version/config skew (server derives whole) reject so the client falls back.
+        if (preq.state_mode == DP_MODE_HYBRID_STREAM && info.hello.state_mode != DP_MODE_HYBRID_STREAM) {
+            return make_error("hybrid-stream mode not supported for this model", ERROR_TYPE_INVALID_REQUEST);
+        }
+        if (preq.want_dft && !info.hello.has_dft) {
+            return make_error("draft state not available", ERROR_TYPE_INVALID_REQUEST);
+        }
+        if (preq.tokens.size() + 1 > info.n_tokens_max) {
+            return make_error("prompt exceeds serving context size", ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+        }
+
+        auto pipe = std::make_shared<dp_pipe>();
+
+        server_task task(SERVER_TASK_TYPE_REMOTE_PREFILL);
+        task.id                  = queue_tasks.get_new_id();
+        pipe->id_task            = task.id;
+        task.prefill_pipe        = pipe;
+        task.prefill_p0          = preq.p0;
+        task.prefill_state_mode  = (uint8_t) preq.state_mode;
+        task.prefill_want_dft    = preq.want_dft;
+        task.tokens.insert(preq.tokens);
+        task.params.cache_prompt = true;
+        task.params.n_predict    = 0;
+        queue_tasks.post(std::move(task));
+
+        return std::make_unique<server_prefill_res>(queue_tasks, pipe, req.should_stop);
+    };
+
     this->get_metrics = [this](const server_http_req & req) {
         auto res = create_response();
         if (!params.endpoint_metrics) {
@@ -4392,6 +5125,22 @@ void server_routes::init_routes() {
                     {"name",  "n_tokens_max"},
                     {"help",  "Largest observed n_tokens."},
                     {"value",  res_task->n_tokens_max}
+            }, {
+                    {"name",  "prefill_delegated_total"},
+                    {"help",  "Number of prompt prefills delegated to a remote server."},
+                    {"value",  res_task->n_prefill_delegated}
+            }, {
+                    {"name",  "prefill_fallback_total"},
+                    {"help",  "Number of delegated prefills that fell back to local processing."},
+                    {"value",  res_task->n_prefill_fallback}
+            }, {
+                    {"name",  "prefill_delegated_tokens_total"},
+                    {"help",  "Number of prompt tokens prefilled by a remote server."},
+                    {"value",  res_task->n_prefill_delegated_tokens}
+            }, {
+                    {"name",  "prefill_rpc_bytes_total"},
+                    {"help",  "Bytes of KV state received from remote prefill servers."},
+                    {"value",  res_task->n_prefill_rpc_bytes}
             }}},
             {"gauge", {{
                     {"name",  "prompt_tokens_seconds"},
@@ -5072,6 +5821,19 @@ void server_routes::init_routes() {
 }
 
 json server_routes::get_model_info() const {
+    const dp_serve_info prefill = ctx_server.prefill_serve_info();
+    json prefill_json = { {"enabled", prefill.active} };
+    if (prefill.active) {
+        prefill_json["mode"]      = dp_state_mode_str(prefill.hello.state_mode);
+        prefill_json["arch"]      = prefill.hello.arch;
+        prefill_json["n_layer"]   = prefill.hello.n_layer;
+        prefill_json["n_embd"]    = prefill.hello.n_embd;
+        prefill_json["n_head_kv"] = prefill.hello.n_head_kv;
+        prefill_json["n_ctx"]     = prefill.hello.n_ctx;
+        prefill_json["type_k"]    = prefill.hello.type_k;
+        prefill_json["type_v"]    = prefill.hello.type_v;
+        prefill_json["has_dft"]   = prefill.hello.has_dft;
+    }
     return json {
         {"id",       meta->model_name},
         {"aliases",  meta->model_aliases},
@@ -5079,6 +5841,7 @@ json server_routes::get_model_info() const {
         {"object",   "model"},
         {"created",  std::time(0)},
         {"owned_by", "llamacpp"},
+        {"prefill",  prefill_json},
         {"meta",     {
             {"vocab_type",  meta->model_vocab_type},
             {"n_vocab",     meta->model_vocab_n_tokens},

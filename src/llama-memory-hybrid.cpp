@@ -187,7 +187,14 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
     return mb;
 }
 
-void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos p0, llama_pos p1) const {
+    if (p0 != -1 || p1 != -1) {
+        // only the attention KV is rangeable; the recurrent state is bounded and
+        // streamed separately as a whole blob (PARTIAL_ONLY)
+        mem_attn->state_write(io, seq_id, flags, p0, p1);
+        return;
+    }
+
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         mem_attn->state_write(io, seq_id, flags);
     }
@@ -195,6 +202,13 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (flags & LLAMA_STATE_SEQ_FLAGS_APPEND) {
+        // only the attention KV appends ranges; the recurrent state is applied
+        // separately as a whole blob (PARTIAL_ONLY)
+        mem_attn->state_read(io, seq_id, flags);
+        return;
+    }
+
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         mem_attn->state_read(io, seq_id, flags);
     }

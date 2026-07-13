@@ -4,6 +4,8 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include <stdexcept>
+
 //
 // llama_memory_hybrid_iswa
 //
@@ -192,12 +194,20 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_br
     return mb;
 }
 
-void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos p0, llama_pos p1) const {
+    if (p0 != -1 || p1 != -1) {
+        throw std::runtime_error("range-bounded state_write not supported for this memory type");
+    }
+
     mem_attn->state_write(io, seq_id, flags);
     mem_recr->state_write(io, seq_id, flags);
 }
 
 void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (flags & LLAMA_STATE_SEQ_FLAGS_APPEND) {
+        throw std::runtime_error("LLAMA_STATE_SEQ_FLAGS_APPEND not supported for this memory type");
+    }
+
     mem_attn->state_read(io, seq_id, flags);
     mem_recr->state_read(io, seq_id, flags);
 }

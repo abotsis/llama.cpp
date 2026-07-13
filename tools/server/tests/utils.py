@@ -114,6 +114,12 @@ class ServerProcess:
     backend_sampling: bool = False
     gcp_compat: bool = False
     server_tools: str | None = None
+    prefill_serve: bool | None = None
+    prefill_rpc: str | None = None
+    prefill_rpc_min_tokens: int | None = None
+    prefill_rpc_mode: str | None = None
+    prefill_rpc_api_key: str | None = None
+    extra_env: dict | None = None
 
     # session variables
     process: subprocess.Popen | None = None
@@ -131,6 +137,8 @@ class ServerProcess:
         env = {**os.environ}
         if "LLAMA_CACHE" not in os.environ:
             env["LLAMA_CACHE"] = "tmp"
+        if self.extra_env:
+            env.update({k: str(v) for k, v in self.extra_env.items()})
         if self.external_server:
             print(f"[external_server]: Assuming external server running on {self.server_host}:{self.server_port}")
             return
@@ -263,6 +271,16 @@ class ServerProcess:
             server_args.append("--backend_sampling")
         if self.gcp_compat:
             env["AIP_MODE"] = "PREDICTION"
+        if self.prefill_serve:
+            server_args.append("--prefill-serve")
+        if self.prefill_rpc:
+            server_args.extend(["--prefill-rpc", self.prefill_rpc])
+        if self.prefill_rpc_min_tokens is not None:
+            server_args.extend(["--prefill-rpc-min-tokens", self.prefill_rpc_min_tokens])
+        if self.prefill_rpc_mode:
+            server_args.extend(["--prefill-rpc-mode", self.prefill_rpc_mode])
+        if self.prefill_rpc_api_key:
+            server_args.extend(["--prefill-rpc-api-key", self.prefill_rpc_api_key])
 
         args = [str(arg) for arg in [server_path, *server_args]]
         print(f"tests: starting server with: {' '.join(args)}")
@@ -567,6 +585,24 @@ class ServerPreset:
         server.model_alias = "stories15m-moe"
         server.n_ctx = 2048
         server.n_batch = 1024
+        server.n_slots = 1
+        server.n_predict = 64
+        server.temperature = 0.0
+        server.seed = 42
+        return server
+
+    @staticmethod
+    def hybrid_lfm2() -> ServerProcess:
+        server = ServerProcess()
+        server.offline = True # will be downloaded by load_all()
+        # plain-hybrid (recurrent + full-attention, non-SWA) model: derives the
+        # hybrid_stream prefill mode. text-only, so no mmproj is auto-loaded.
+        server.model_hf_repo = "ggml-org/LFM2-test-ci-80M"
+        server.model_hf_file = "model-Q4_K_M.gguf"
+        server.model_alias = "hybrid-lfm2"
+        server.n_ctx = 2048
+        server.n_batch = 64
+        server.n_ubatch = 64
         server.n_slots = 1
         server.n_predict = 64
         server.temperature = 0.0

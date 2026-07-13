@@ -133,7 +133,10 @@ bool server_http_context::init(const common_params & params) {
     });
 
     srv->set_error_handler([](const httplib::Request &, httplib::Response & res) {
-        if (res.status == 404) {
+        // httplib calls this for every response with status >= 400, including ones a route
+        // handler already populated (e.g. a deliberate 404 with its own JSON body); only fill in
+        // the generic message when nothing matched a route in the first place
+        if (res.status == 404 && res.body.empty()) {
             res.set_content(
                 safe_json_to_str(json {
                     {"error", {

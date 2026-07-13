@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <stdexcept>
 
 //
 // llama_kv_cache_dsa
@@ -160,12 +161,20 @@ bool llama_kv_cache_dsa::get_can_shift() const {
            kv_mla->get_size() == kv_lid->get_size();
 }
 
-void llama_kv_cache_dsa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+void llama_kv_cache_dsa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos p0, llama_pos p1) const {
+    if (p0 != -1 || p1 != -1) {
+        throw std::runtime_error("range-bounded state_write not supported for this memory type");
+    }
+
     kv_mla->state_write(io, seq_id, flags);
     kv_lid->state_write(io, seq_id, flags);
 }
 
 void llama_kv_cache_dsa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (flags & LLAMA_STATE_SEQ_FLAGS_APPEND) {
+        throw std::runtime_error("LLAMA_STATE_SEQ_FLAGS_APPEND not supported for this memory type");
+    }
+
     kv_mla->state_read(io, seq_id, flags);
     kv_lid->state_read(io, seq_id, flags);
 }

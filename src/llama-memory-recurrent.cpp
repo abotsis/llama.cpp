@@ -730,8 +730,10 @@ size_t llama_memory_recurrent::size_s_bytes() const {
     return size_s_bytes;
 }
 
-void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    GGML_UNUSED(flags);
+void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos p0, llama_pos p1) const {
+    if (p0 != -1 || p1 != -1) {
+        throw std::runtime_error("range-bounded state_write not supported for this memory type");
+    }
 
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data; // logical source row ranges
@@ -811,7 +813,9 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    GGML_UNUSED(flags);
+    if (flags & LLAMA_STATE_SEQ_FLAGS_APPEND) {
+        throw std::runtime_error("LLAMA_STATE_SEQ_FLAGS_APPEND not supported for this memory type");
+    }
 
     uint32_t cell_count;
     io.read(&cell_count, sizeof(cell_count));

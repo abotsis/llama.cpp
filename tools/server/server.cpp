@@ -220,6 +220,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
         ctx_http.post("/models/unload",        ex_wrapper(models_routes->post_router_models_unload));
         ctx_http.get ("/models/sse",           ex_wrapper(models_routes->get_router_models_sse));
         ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
+    } else {
+        // serving side of disaggregated prefill (see --prefill-serve)
+        if (params.prefill_serve) {
+            ctx_http.post("/v1/prefill",       ex_wrapper(routes.post_prefill));
+        }
     }
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)

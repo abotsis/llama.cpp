@@ -233,6 +233,28 @@ set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download
 llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+llama_build_and_test(test-state-seq-range.cpp)
+
+# Hybrid (recurrent + full-attention) round-trip: exercises the attention-range +
+# recurrent-whole split restore and the bitwise logits equality. Needs a plain
+# hybrid model, so fetch a small one (ggml-org-hosted, CI-appropriate).
+set(HYBRID_MODEL_REPO "ggml-org/LFM2-test-ci-80M")
+set(HYBRID_MODEL_NAME "model-Q4_K_M.gguf")
+set(HYBRID_MODEL_HASH "SHA256=7a9c25eb202cba66965ba2d20f986e77eb9b8afebe114c11dae0f690e8448388")
+set(HYBRID_MODEL_DEST "${CMAKE_BINARY_DIR}/LFM2-test-ci-80M/${HYBRID_MODEL_NAME}")
+
+add_test(NAME test-download-model-hybrid COMMAND ${CMAKE_COMMAND}
+    -DREPO=${HYBRID_MODEL_REPO}
+    -DDEST=${HYBRID_MODEL_DEST}
+    -DNAME=${HYBRID_MODEL_NAME}
+    -DHASH=${HYBRID_MODEL_HASH}
+    -P ${CMAKE_SOURCE_DIR}/cmake/download-models.cmake
+)
+set_tests_properties(test-download-model-hybrid PROPERTIES FIXTURES_SETUP test-download-model-hybrid)
+
+llama_build_and_test(test-state-seq-range.cpp NAME test-state-seq-range-hybrid LABEL "model" ARGS "${HYBRID_MODEL_DEST}")
+set_tests_properties(test-state-seq-range-hybrid PROPERTIES FIXTURES_REQUIRED test-download-model-hybrid)
+
 llama_build_and_test(test-arg-parser.cpp)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)

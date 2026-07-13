@@ -891,6 +891,11 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// Restore without clearing the destination sequence first. Used to apply
+// position-range state blobs incrementally; the caller must apply ranges in
+// ascending position order. Not supported together with ON_DEVICE.
+#define LLAMA_STATE_SEQ_FLAGS_APPEND 4
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(
@@ -910,6 +915,30 @@ extern "C" {
                    const uint8_t * src,
                           size_t   size,
                     llama_seq_id   dest_seq_id,
+           llama_state_seq_flags   flags);
+
+    // Same as llama_state_seq_get_size_ext, restricted to cells with pos in [p0, p1).
+    // p0 = -1 and/or p1 = -1 mean unbounded (equivalent to the whole state).
+    // For a plain hybrid model this serializes only the attention (KV) sub-state
+    // for the range; the recurrent sub-state is bounded and must be transferred
+    // whole via LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY. Restore the range blobs with
+    // LLAMA_STATE_SEQ_FLAGS_APPEND in ascending position order.
+    // Returns 0 if the memory module does not support ranges (pure recurrent,
+    // SWA/iswa, and hybrid-iswa).
+    LLAMA_API size_t llama_state_seq_get_size_range(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   p0,
+                       llama_pos   p1,
+           llama_state_seq_flags   flags);
+
+    LLAMA_API size_t llama_state_seq_get_data_range(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+                       llama_pos   p0,
+                       llama_pos   p1,
            llama_state_seq_flags   flags);
 
     //

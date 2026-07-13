@@ -21,6 +21,8 @@ add_library(${TARGET} STATIC
     server-tools.h
     server-schema.cpp
     server-schema.h
+    server-prefill.cpp
+    server-prefill.h
 )
 
 if (BUILD_SHARED_LIBS)
@@ -29,7 +31,11 @@ endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PUBLIC llama-common mtmd cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
+
+if (WIN32)
+    target_link_libraries(${TARGET} PUBLIC ws2_32)
+endif()
 
 # llama-server-impl: server logic, reusable by app
 

@@ -130,6 +130,10 @@ std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_i
 struct server_tokens {
     bool has_mtmd = false;
 
+    // whether any media (image/audio) chunks are actually present; text-only
+    // prompts on a multimodal-enabled server have has_mtmd set but no media
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
 private: // disallow accessing these members directly, risking out-of-sync
 
     // map a **start** index in tokens to the image chunk

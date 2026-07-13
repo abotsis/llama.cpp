@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <memory>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -25,6 +26,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_REMOTE_PREFILL,
+    SERVER_TASK_TYPE_PREFILL_RESULT,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -133,6 +136,8 @@ struct task_result_state {
         bool filter_tool_calls = false);
 };
 
+struct dp_pipe;
+
 struct server_task {
     int id = -1; // to be filled by server_queue
 
@@ -168,6 +173,29 @@ struct server_task {
         std::string filepath;
     };
     slot_action slot_action;
+
+    // used by SERVER_TASK_TYPE_REMOTE_PREFILL (serving side of disaggregated prefill)
+    std::shared_ptr<dp_pipe> prefill_pipe;
+    uint32_t                 prefill_p0 = 0;
+    uint8_t                  prefill_state_mode = 0; // dp_state_mode requested by the decode side
+    bool                     prefill_want_dft   = false;
+
+    // used by SERVER_TASK_TYPE_PREFILL_RESULT (delegating side)
+    struct prefill_result {
+        int         id_slot    = -1;
+        int         id_task    = -1;
+        uint64_t    generation = 0; // process-local; matched against server_slot::dp_generation
+        bool        is_done    = false;
+        bool        ok         = true;
+        uint32_t    p0         = 0;
+        uint32_t    p1         = 0;
+        raw_buffer  blob;
+        std::string msg;
+        bool        whole      = false; // true: blob/blob_dft are a terminal state (apply, not append)
+        bool        recurrent  = false; // hybrid-stream: blob is the recurrent tail (PARTIAL_ONLY); attention came via chunks
+        raw_buffer  blob_dft;           // whole/hybrid-stream: MTP draft context state, empty if not requested
+    };
+    prefill_result prefill_res;
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
@@ -531,6 +559,11 @@ struct server_task_result_metrics : server_task_result {
 
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
+
+    uint64_t n_prefill_delegated = 0;
+    uint64_t n_prefill_fallback  = 0;
+    uint64_t n_prefill_delegated_tokens = 0;
+    uint64_t n_prefill_rpc_bytes        = 0;
 
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result

@@ -1066,7 +1066,94 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:requests_deferred` | Gauge | Number of requests deferred. |
 | `llamacpp:n_tokens_max` | Counter | High watermark of the context size observed. |
 | `llamacpp:n_decode_total` | Counter | Total Number of llama_decode() calls. |
+| `llamacpp:prefill_delegated_total` | Counter | Number of prompt prefills delegated to a remote server. |
+| `llamacpp:prefill_fallback_total` | Counter | Number of delegated prefills that fell back to local processing. |
+| `llamacpp:prefill_delegated_tokens_total` | Counter | Number of prompt tokens prefilled by a remote server. |
+| `llamacpp:prefill_rpc_bytes_total` | Counter | Bytes of KV state received from remote prefill servers. |
 | `llamacpp:n_busy_slots_per_decode` | Gauge | Average number of busy slots per llama_decode() call. |
+
+### Disaggregated prefill (experimental)
+
+Full documentation: [docs/disaggregated-prefill.md](../../docs/disaggregated-prefill.md)
+
+A llama-server instance can delegate the prefill of a long prompt to a second
+llama-server instance over HTTP (`POST /v1/prefill` on the peer's main port), so a
+slow (e.g. Metal/CPU) box can hand prompt processing to a fast (e.g. CUDA) box and
+reduce time-to-first-token. This is off by default and configured via CLI flags; the
+data plane rides the server's normal HTTP stack, so `--api-key` and TLS apply to it
+like any other endpoint.
+
+There are three KV transfer modes, derived per model:
+
+- **stream** (dense models): attention KV streamed as position-range chunks that overlap
+  transfer with remote compute.
+- **hybrid_stream** (plain, non-SWA hybrids, e.g. Qwen3.5/3.6, Qwen3-Next): the full
+  attention KV is streamed by range like dense models, and only the small, O(1)-in-tokens
+  recurrent state is sent whole at the end - so transfer overlaps compute and host memory
+  is bounded (no giant blob, no OOM at long context).
+- **whole** (SWA / hybrid-iswa and pure-recurrent models, e.g. Mamba, or any model when
+  forced): the complete sequence state (plus an MTP draft-context state, if present) is
+  sent as one blob once prefill completes; no transfer/compute overlap.
+
+Each side derives its mode from its own model; `--prefill-rpc-mode
+auto|stream|whole|hybrid_stream` overrides the decode side's choice. See the full
+documentation above for the protocol, failure semantics, and a manual verification
+checklist for hybrid/MTP models.
+
+Two flags, one per side:
+
+- `--prefill-serve` (prefill side): boolean flag that registers `POST /v1/prefill` on
+  this instance's main HTTP port to serve prefill requests from a peer decode server,
+  alongside its normal endpoints.
+- `--prefill-rpc HOST:PORT` (decode side): delegate prefill to the peer's main HTTP
+  address whenever a request's uncached prompt suffix exceeds
+  `--prefill-rpc-min-tokens`.
+- `--prefill-rpc-min-tokens N` (decode side): minimum uncached-suffix length, in
+  tokens, before a prefill is delegated (default: 512). Shorter prompts are always
+  processed locally.
+- `--prefill-rpc-max-inflight N` (decode side): maximum number of concurrent
+  delegations to the peer (default: 1).
+- `--prefill-rpc-api-key KEY` (decode side): sent as `Authorization: Bearer KEY` on
+  `POST /v1/prefill` (match the prefill server's `--api-key`).
+
+Requirements:
+
+- Both servers must load the same model and be configured with the same KV cache
+  type (e.g. matching `--cache-type-k` / `--cache-type-v`) and context size - KV
+  state is streamed as-is, not converted across configurations.
+- LoRA adapters must match on both sides. There is no negotiation: a mismatch is
+  only logged as a warning, not blocked, so keep `--lora` flags identical.
+- Not supported (delegation is skipped and the request is prefilled locally
+  instead): SWA models, multimodal (mtmd) requests, a separate `--model-draft`
+  (classic speculative decoding), and requests that trigger an aLoRA invocation.
+  Plain (non-SWA) hybrid models (e.g. Qwen3.5/3.6, Qwen3-Next) are supported via
+  hybrid_stream mode (attention KV streamed by range + recurrent state sent whole);
+  pure-recurrent (e.g. Mamba) and SWA / hybrid-iswa models use whole-blob mode. An MTP
+  draft context (`--spec-type`, same model) is carried in whole and hybrid_stream mode -
+  see docs/disaggregated-prefill.md.
+
+Trust model: `POST /v1/prefill` is served on the normal HTTP stack, so `--api-key`
+(and TLS, if configured) protect it like any other endpoint. It stays opt-in via
+`--prefill-serve` (off by default) because it lets an authenticated caller compute and
+download the raw KV state for arbitrary token sequences - treat that access as
+sensitive when deciding who may reach the endpoint.
+
+Delegation failures (connection refused, timeout, protocol error, mid-stream
+disconnect) are never user-visible: the slot falls back to local prefill, reusing
+whatever prefix was already applied remotely. See the `llamacpp:prefill_delegated_total`,
+`llamacpp:prefill_fallback_total`, `llamacpp:prefill_delegated_tokens_total`, and
+`llamacpp:prefill_rpc_bytes_total` metrics above for observability, and the server
+log for a per-delegation summary line (tokens, MiB received, elapsed time).
+
+Example, two machines:
+
+```
+# fast GPU box (prefill server) - serves POST /v1/prefill on its main port
+llama-server -m model.gguf --host 0.0.0.0 --port 8080 --prefill-serve
+
+# user-facing box (decode server) - points --prefill-rpc at the peer's main port
+llama-server -m model.gguf --prefill-rpc gpubox:8080 --prefill-rpc-min-tokens 512
+```
 
 ### POST `/slots/{id_slot}?action=save`: Save the prompt cache of the specified slot to a file.
 

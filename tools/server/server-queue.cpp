@@ -132,6 +132,11 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
         if (idle_sleep_ms < 0) {
             return false;
         }
+        // never sleep while a slot is still processing (e.g. waiting on a remote prefill
+        // delegation) - the queue can look idle to this loop even though a request is in flight
+        if (callback_is_processing && callback_is_processing()) {
+            return false;
+        }
         int64_t now = ggml_time_ms();
         return (now - time_last_task) >= idle_sleep_ms;
     };

@@ -3217,6 +3217,55 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--prefill-serve"},
+        {"--no-prefill-serve"},
+        string_format("serve remote prefill requests over POST /v1/prefill (disaggregated prefill; "
+                      "insecure, private networks only) (default: %s)", params.prefill_serve ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.prefill_serve = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFILL_SERVE"));
+    add_opt(common_arg(
+        {"--prefill-rpc"}, "HOST:PORT",
+        "delegate long prompt prefill to this remote llama-server (see --prefill-serve)",
+        [](common_params & params, const std::string & value) {
+            params.prefill_rpc = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFILL_RPC"));
+    add_opt(common_arg(
+        {"--prefill-rpc-min-tokens"}, "N",
+        string_format("minimum uncached suffix length to delegate prefill (default: %d)", params.prefill_rpc_min_tokens),
+        [](common_params & params, int value) {
+            params.prefill_rpc_min_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFILL_RPC_MIN_TOKENS"));
+    add_opt(common_arg(
+        {"--prefill-rpc-max-inflight"}, "N",
+        string_format("maximum concurrent prefill delegations (default: %d)", params.prefill_rpc_max_inflight),
+        [](common_params & params, int value) {
+            params.prefill_rpc_max_inflight = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFILL_RPC_MAX_INFLIGHT"));
+    add_opt(common_arg(
+        {"--prefill-rpc-mode"}, "{auto,stream,whole,hybrid_stream}",
+        string_format("prefill transfer mode for --prefill-rpc: auto derives from the model, "
+                       "stream/whole/hybrid_stream force it (default: %s)", params.prefill_rpc_mode.c_str()),
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "auto")          { params.prefill_rpc_mode = value; }
+            else if (value == "stream")        { params.prefill_rpc_mode = value; }
+            else if (value == "whole")         { params.prefill_rpc_mode = value; }
+            else if (value == "hybrid_stream") { params.prefill_rpc_mode = value; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFILL_RPC_MODE"));
+    add_opt(common_arg(
+        {"--prefill-rpc-api-key"}, "KEY",
+        "API key sent as \"Authorization: Bearer\" on /v1/prefill to the prefill peer",
+        [](common_params & params, const std::string & value) {
+            params.prefill_rpc_api_key = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFILL_RPC_API_KEY"));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {

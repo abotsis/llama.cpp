@@ -672,6 +672,14 @@ struct common_params {
     std::string slot_save_path;
     std::string media_path; // path to directory for loading media files
 
+    bool prefill_serve = false; // serve remote prefill requests over POST /v1/prefill
+
+    std::string prefill_rpc;                    // host:port of a remote prefill server
+    int32_t     prefill_rpc_min_tokens   = 512;  // min uncached suffix length to delegate
+    int32_t     prefill_rpc_max_inflight = 1;    // max concurrent prefill delegations
+    std::string prefill_rpc_mode         = "auto"; // auto | stream | whole | hybrid_stream
+    std::string prefill_rpc_api_key;                // sent as "Authorization: Bearer" to the prefill peer
+
     float slot_prompt_similarity = 0.1f;
 
     // batched-bench params
